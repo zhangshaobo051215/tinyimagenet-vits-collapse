@@ -1,0 +1,30 @@
+{
+  "data_root": "C:\\Users\\lenovo\\Documents\\Codex\\2026-06-28\\shi\\work\\data\\tiny-imagenet-200",
+  "output_dir": "C:\\Users\\lenovo\\Documents\\Codex\\2026-06-28\\shi\\outputs\\schedule_collapse_per_tensor_20000_steps_quiet",
+  "model": "vit_tiny_patch16_224",
+  "img_size": 64,
+  "schedules": [
+    "constant",
+    "linear_up",
+    "linear_down",
+    "cosine_wave"
+  ],
+  "base_lr": 0.001,
+  "gamma_lr_mult": 1.0,
+  "head_lr_mult": 1.0,
+  "weight_decay": 0.0,
+  "batch_size": 64,
+  "max_train_samples": 8192,
+  "steps_per_run": 20000,
+  "max_steps": null,
+  "control_start_step": 0,
+  "num_workers": 0,
+  "seed": 42,
+  "rmsnorm_eps": 1e-06,
+  "cooldown_frac": 0.25,
+  "ema_beta": 0.98,
+  "amp": true,
+  "no_progress": true,
+  "flush_every": 100,
+  "print_every": 1000
+}
