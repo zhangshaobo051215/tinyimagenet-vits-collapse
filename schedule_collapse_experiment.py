@@ -40,7 +40,11 @@ def parse_args():
     parser.add_argument("--max-train-samples", type=int, default=8192)
     parser.add_argument("--steps-per-run", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--control-start-step", type=int, default=0)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--control-start-step", type=int, default=5000)
+    parser.add_argument("--decay-frac", type=float, default=0.1)
+    parser.add_argument("--floor-lr-mult", type=float, default=0.1)
+    parser.add_argument("--include-head-in-norm-control", action="store_true")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rmsnorm-eps", type=float, default=1e-6)
@@ -73,13 +77,18 @@ def schedule_ratio(name, progress):
     raise ValueError(f"Unknown schedule {name}")
 
 
-def cooldown_multiplier(progress, cooldown_frac):
-    if cooldown_frac <= 0:
+def base_lr_multiplier(step, total_steps, warmup_steps, decay_frac, floor_lr_mult):
+    iter_num = step - 1
+    if warmup_steps > 0 and iter_num < warmup_steps:
+        return (iter_num + 1) / warmup_steps
+
+    decay_steps = max(1, int(round(total_steps * decay_frac)))
+    decay_start = max(warmup_steps, total_steps - decay_steps)
+    if iter_num < decay_start:
         return 1.0
-    start = 1.0 - cooldown_frac
-    if progress <= start:
-        return 1.0
-    return max(0.0, (1.0 - progress) / cooldown_frac)
+
+    progress = min(1.0, (iter_num - decay_start + 1) / max(1, total_steps - decay_start))
+    return floor_lr_mult + (1.0 - progress) * (1.0 - floor_lr_mult)
 
 
 def load_train_dataset(data_root, img_size, max_samples, seed):
@@ -133,17 +142,24 @@ def create_rmsnorm_vit(model_name, img_size, rmsnorm_eps):
     )
 
 
-def split_parameters(model):
+def is_classifier_head(name):
+    return name.startswith(("head", "head_dist", "fc", "classifier"))
+
+
+def split_parameters(model, include_head_in_norm_control):
     matrix_params = []
     vector_params = []
+    head_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim >= 2:
+        if is_classifier_head(name) and not include_head_in_norm_control:
+            head_params.append(param)
+        elif param.ndim >= 2:
             matrix_params.append(param)
         else:
             vector_params.append(param)
-    return matrix_params, vector_params
+    return matrix_params, vector_params, head_params
 
 
 def global_rms(params):
@@ -188,9 +204,12 @@ def logits_from_output(output):
     return output
 
 
-def set_optimizer_lrs(optimizer, lr):
+def set_optimizer_lrs(optimizer, scheduled_lr, base_lr, head_lr_mult):
     for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
+        if param_group.get("lr_role") == "head":
+            param_group["lr"] = base_lr * head_lr_mult
+        else:
+            param_group["lr"] = scheduled_lr
 
 
 def run_one(args, dataset, base_state, schedule_name, device, writer, metrics_file):
@@ -200,7 +219,7 @@ def run_one(args, dataset, base_state, schedule_name, device, writer, metrics_fi
     model = model.to(device)
     model.train()
 
-    matrix_params, vector_params = split_parameters(model)
+    matrix_params, vector_params, head_params = split_parameters(model, args.include_head_in_norm_control)
     initial_matrix_rms = global_rms(matrix_params)
     reference_fro_norms = None
     reference_matrix_rms = initial_matrix_rms
@@ -208,12 +227,31 @@ def run_one(args, dataset, base_state, schedule_name, device, writer, metrics_fi
     if args.weight_decay != 0.0:
         raise ValueError("Per-tensor norm control replaces weight decay; set --weight-decay 0.0")
 
-    optimizer = optim.Adam(
-        [
-            {"params": matrix_params, "lr": args.base_lr, "weight_decay": 0.0, "optimizer_name": "norm_control_adam"},
-            {"params": vector_params, "lr": args.base_lr, "weight_decay": 0.0, "optimizer_name": "adam"},
-        ]
-    )
+    optim_groups = [
+        {
+            "params": matrix_params,
+            "lr": args.base_lr,
+            "weight_decay": 0.0,
+            "optimizer_name": "norm_control_adam",
+            "lr_role": "scheduled",
+        },
+        {
+            "params": vector_params,
+            "lr": args.base_lr,
+            "weight_decay": 0.0,
+            "optimizer_name": "adam",
+            "lr_role": "scheduled",
+        },
+    ]
+    if head_params:
+        optim_groups.append({
+            "params": head_params,
+            "lr": args.base_lr * args.head_lr_mult,
+            "weight_decay": 0.0,
+            "optimizer_name": "adam_head",
+            "lr_role": "head",
+        })
+    optimizer = optim.Adam(optim_groups)
     loss_fn = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
     amp_enabled = args.amp and device.type == "cuda"
@@ -241,22 +279,31 @@ def run_one(args, dataset, base_state, schedule_name, device, writer, metrics_fi
             loader_iter = iter(loader)
             x, y = next(loader_iter)
         step += 1
+        iter_num = step - 1
         active_control_steps = max(1, total_steps - args.control_start_step)
-        if step <= args.control_start_step:
+        if iter_num < args.control_start_step:
             control_active = False
             control_progress = 0.0
             ratio = 1.0
         else:
             control_active = True
-            control_progress = min(1.0, (step - args.control_start_step) / active_control_steps)
+            control_progress = min(1.0, (iter_num - args.control_start_step + 1) / active_control_steps)
             ratio = schedule_ratio(schedule_name, control_progress)
             if reference_fro_norms is None:
                 reference_fro_norms = capture_fro_norms(matrix_params)
                 reference_matrix_rms = global_rms(matrix_params)
         progress = step / total_steps
-        cooldown = cooldown_multiplier(progress, args.cooldown_frac)
-        lr = args.base_lr * ratio * cooldown
-        set_optimizer_lrs(optimizer, lr)
+        base_lr_mult = base_lr_multiplier(
+            step,
+            total_steps,
+            args.warmup_steps,
+            args.decay_frac,
+            args.floor_lr_mult,
+        )
+        base_lr = args.base_lr * base_lr_mult
+        lr = base_lr * ratio
+        head_lr = base_lr * args.head_lr_mult
+        set_optimizer_lrs(optimizer, lr, base_lr, args.head_lr_mult)
 
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
@@ -276,6 +323,7 @@ def run_one(args, dataset, base_state, schedule_name, device, writer, metrics_fi
         target_rms = reference_matrix_rms * ratio
         lr_over_norm = lr / max(controlled_rms, 1e-12)
         vector_rms = global_rms(vector_params)
+        head_rms = global_rms(head_params)
 
         with torch.no_grad():
             loss_value = loss.item()
@@ -292,16 +340,17 @@ def run_one(args, dataset, base_state, schedule_name, device, writer, metrics_fi
             "control_progress": control_progress,
             "control_active": int(control_active),
             "schedule_ratio": ratio,
-            "cooldown": cooldown,
+            "cooldown": base_lr_mult,
             "matrix_lr": lr,
             "gamma_lr": lr,
-            "head_lr": lr,
+            "head_lr": head_lr,
             "target_matrix_rms": target_rms,
             "matrix_rms": controlled_rms,
             "matrix_rms_ratio": controlled_rms / max(reference_matrix_rms, 1e-12),
             "lr_over_matrix_rms": lr_over_norm,
             "lr_over_matrix_rms_ratio": lr_over_norm / max(args.base_lr / reference_matrix_rms, 1e-12),
             "gamma_rms": vector_rms,
+            "head_rms": head_rms,
             "loss": loss_value,
             "loss_ema": loss_ema,
             "logit_rms": logit_rms,
@@ -355,6 +404,7 @@ def main():
         "lr_over_matrix_rms",
         "lr_over_matrix_rms_ratio",
         "gamma_rms",
+        "head_rms",
         "loss",
         "loss_ema",
         "logit_rms",

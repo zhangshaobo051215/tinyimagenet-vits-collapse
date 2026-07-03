@@ -14,11 +14,14 @@ The main added experiment file is:
 
 The collapse script ports the norm-control idea from `temp_super_nano_wd` to a Tiny-ImageNet ViT setting:
 
-- Matrix parameters are tensors with `param.ndim >= 2`.
+- Matrix parameters are tensors with `param.ndim >= 2`, excluding classifier head parameters by default.
 - Vector parameters are tensors with `param.ndim < 2`.
+- Classifier head parameters are trained by ordinary Adam by default and are not norm-controlled. Pass `--include-head-in-norm-control` to recover the earlier behavior.
 - Optimizer is `torch.optim.Adam`.
 - Weight decay is `0.0`.
 - Every matrix tensor records its own reference Frobenius norm.
+- Default LR schedule now follows a WSD-style base schedule with `--warmup-steps 1000`, `--decay-frac 0.1`, and `--floor-lr-mult 0.1`.
+- Default norm-control start is `--control-start-step 5000`, matching the delayed reference-capture style of `temp_super_nano_wd`.
 - After each Adam step, each matrix tensor is projected independently:
 
 ```text
@@ -28,12 +31,25 @@ W <- W * (target_ratio * reference_frobenius_norm / current_frobenius_norm)
 The learning rate is matched to the norm schedule:
 
 ```text
-lr = base_lr * norm_ratio * cooldown
+matrix_lr = base_wsd_lr * norm_ratio
+head_lr   = base_wsd_lr
+```
+
+## Current Code Defaults
+
+The current code defaults are intended to be closer to `temp_super_nano_wd`:
+
+```text
+warmup_steps = 1000
+control_start_step = 5000
+decay_frac = 0.1
+floor_lr_mult = 0.1
+classifier head excluded from norm control
 ```
 
 ## 20000-Step Run
 
-The run used:
+The archived 20000-step run in `results/` was generated before the latest code update. It used the earlier settings below, especially `control_start_step = 0` and classifier head included in norm control. It is kept for reference only.
 
 ```powershell
 python schedule_collapse_experiment.py `
@@ -65,13 +81,13 @@ Results are in:
 
 This is not the original LLM training code from `temp_super_nano_wd`. It is a ViT/Tiny-ImageNet adaptation.
 
-One important difference from the LLM configs is that this run used:
+The archived run used:
 
 ```text
 control_start_step = 0
 ```
 
-The LLM configs in `temp_super_nano_wd` often use:
+The current code default now follows the LLM configs more closely:
 
 ```text
 control_start_iter = 5000
